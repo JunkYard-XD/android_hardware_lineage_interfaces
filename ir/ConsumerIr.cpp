@@ -7,8 +7,8 @@
 
 #include <fcntl.h>
 #include <linux/lirc.h>
-#include <string>
-
+#include <hardware/hardware.h>
+#include <hardware/consumerir.h>
 #include <android-base/logging.h>
 #include <android-base/unique_fd.h>
 #include <ir.sysprop.h>
@@ -17,14 +17,37 @@
 
 using namespace ::vendor::lineage::ir;
 
+static const char kLircDevice[] = "/dev/lirc0";
+static const char kSpiDevice[] = "/dev/spidev7.1";
+
 namespace aidl {
 namespace android {
 namespace hardware {
 namespace ir {
 
-static const std::string kIrDevice = "/dev/lirc0";
-
 ConsumerIr::ConsumerIr() {
+    if (access(kLircDevice, F_OK) == 0) {
+        mUseLirc = true;
+        LOG(INFO) << "Using LIRC device " << kLircDevice;
+    } else if (access(kSpiDevice, F_OK) == 0) {
+        const hw_module_t* hw_module = nullptr;
+        int ret = hw_get_module_by_class(CONSUMERIR_HARDWARE_MODULE_ID, "spi", &hw_module);
+        if (ret != 0) {
+            LOG(ERROR) << "hw_get_module failed for " << kSpiDevice << ": " << ret;
+        } else {
+            ret = hw_module->methods->open(hw_module, CONSUMERIR_TRANSMITTER,
+                                           (hw_device_t**)&mSpiDevice);
+            if (ret != 0) {
+                LOG(ERROR) << "Failed to open " << kSpiDevice << ": " << ret;
+            } else {
+                mUseSpi = true;
+                LOG(INFO) << "Using SPI device " << kSpiDevice;
+            }
+        }
+    } else {
+        LOG(ERROR) << "No IR device available";
+    }
+
     auto carrier_freqs = IrProperties::carrier_freqs();
 
     if (carrier_freqs.size() >= 2) {
@@ -62,30 +85,34 @@ ConsumerIr::ConsumerIr() {
         return ::ndk::ScopedAStatus::fromExceptionCode(EX_UNSUPPORTED_OPERATION);
     }
 
-    ::android::base::unique_fd fd(open(kIrDevice.c_str(), O_WRONLY));
-    if (!fd.ok()) {
-        LOG(ERROR) << "Failed to open " << kIrDevice << ", error: " << strerror(errno);
-        return ::ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_STATE);
-    }
-
-    int rc = ioctl(fd, LIRC_SET_SEND_CARRIER, &carrierFreqHz);
-    if (rc < 0) {
-        LOG(ERROR) << "Failed to set carrier " << carrierFreqHz << ", error: " << errno;
-        return ::ndk::ScopedAStatus::fromExceptionCode(EX_UNSUPPORTED_OPERATION);
-    }
-
-    /*
-     * Pattern is an alternating series of on and off periods.
-     * Kernel needs pattern to have an odd size, which means ending with
-     * an on period. If pattern is even in size, drop the last off period.
-     */
     if (entries % 2 == 0) {
         entries--;
     }
 
-    rc = write(fd, pattern.data(), entries * sizeof(int32_t));
-    if (rc < 0) {
-        LOG(ERROR) << "Failed to write pattern, " << entries << " entries, error: " << errno;
+    if (mUseLirc) {
+        ::android::base::unique_fd fd(open(kLircDevice, O_WRONLY));
+        if (!fd.ok()) {
+            LOG(ERROR) << "Failed to open " << kLircDevice << ": " << strerror(errno);
+            return ::ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_STATE);
+        }
+        int rc = ioctl(fd.get(), LIRC_SET_SEND_CARRIER, &carrierFreqHz);
+        if (rc < 0) {
+            LOG(ERROR) << "Failed to set carrier " << carrierFreqHz << ": " << strerror(errno);
+            return ::ndk::ScopedAStatus::fromExceptionCode(EX_UNSUPPORTED_OPERATION);
+        }
+        rc = write(fd.get(), pattern.data(), entries * sizeof(int32_t));
+        if (rc < 0) {
+            LOG(ERROR) << "Failed to write pattern, " << entries << " entries: " << strerror(errno);
+            return ::ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_STATE);
+        }
+    } else if (mUseSpi) {
+        int rc = mSpiDevice->transmit(mSpiDevice, carrierFreqHz, pattern.data(), entries);
+        if (rc != 0) {
+            LOG(ERROR) << "Failed to transmit pattern, error: " << rc;
+            return ::ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_STATE);
+        }
+    } else {
+        LOG(ERROR) << "No IR device available";
         return ::ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_STATE);
     }
 
